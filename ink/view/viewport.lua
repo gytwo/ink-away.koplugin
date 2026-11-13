@@ -8,11 +8,22 @@ local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
 local UIManager = require("ui/uimanager")
 local InkGeom = require("ink/geom")
+local Accent = require("ink/accent")
+local Theme = require("ink/ui/theme")
 
 local Screen = Device.screen
 
 local ZOOM_RATIO = 1.5    -- one zoom press multiplies by this, for even steps
 local ZOOM_MAX = 8.0
+local PAN_SETTLE_SEC = 0.2   -- a panned page is drawn once it has rested this long (see panMapStep)
+local WHITE = Blitbuffer.COLOR_WHITE
+local BLACK = Blitbuffer.COLOR_BLACK
+-- the map is dressed like the floating controls (see FAB_FILL and FAB_BORDER in
+-- ink/view/toolbar.lua): a light rounded card with a thin grey edge
+local CARD_FILL   = Blitbuffer.ColorRGB32(0xF0, 0xF0, 0xF0, 0xFF)
+local CARD_BORDER = Blitbuffer.ColorRGB32(0xB4, 0xB4, 0xB4, 0xFF)
+local PAGE_EDGE   = Blitbuffer.ColorRGB32(0x78, 0x78, 0x78, 0xFF)
+local VIEW_FILL   = Blitbuffer.ColorRGB32(0xD2, 0xD2, 0xD2, 0xFF)
 
 local InkAwayView = {}
 
@@ -314,7 +325,103 @@ function InkAwayView:panByScreen(dx, dy)
         self:liveDirty("ui", { x0 = 0, y0 = 0, x1 = v.area_w, y1 = v.area_h })
         return
     end
+    if self:panMapOn() then return self:panMapStep() end
     self:redraw()
+end
+
+------------------------------------------------------------------------------
+-- The pan map (Settings, Screen: on for a colour panel unless turned off)
+--
+-- A colour panel takes several tenths of a second over a refresh of the whole
+-- drawing area, so a page that is scaled and refreshed as the finger moves
+-- trails far behind it, however the steps are paced. The page is left as it is
+-- instead while it is panned, and a small map in the middle of the area shows
+-- where the view is: the page's outline with the visible part as a box inside
+-- it. Only the map is refreshed, with the fast waveform. Once nothing has moved
+-- for PAN_SETTLE_SEC the page is drawn where it ended, once.
+--
+-- A grey panel refreshes quickly enough for the page to follow the finger, so
+-- the map is off there unless it is asked for (a large or slow one may want it).
+------------------------------------------------------------------------------
+
+-- Is a pan shown as the map? As set in Settings, else on a colour panel only.
+-- (Android paces its pans its own way, see panByScreen.)
+function InkAwayView:panMapOn()
+    if self:onAndroid() then return false end
+    local set = self:getSetting("inkaway_pan_map")
+    if set == nil then return self:colourPanel() end
+    return set == true
+end
+
+-- The map in area-local pixels: the page's outline {x, y, w, h}, the visible
+-- part's box inside it, the outline's line width, and the card the outline sits
+-- on, {x, y, w, h, r} with its corner radius.
+function InkAwayView:panMapRects()
+    local v = self.view
+    local scale = math.min(v.area_w, v.area_h) / 4 / math.max(v.canvas_w, v.canvas_h)
+    local line = math.max(2, math.floor(Screen:scaleBySize(2)))
+    local w = math.max(8 * line, math.floor(v.canvas_w * scale))
+    local h = math.max(8 * line, math.floor(v.canvas_h * scale))
+    local x = math.floor((v.area_w - w) / 2)
+    local y = math.floor((v.area_h - h) / 2)
+    local function span(pan, seen, page, len)
+        local n = math.max(3 * line, math.min(len, math.floor(math.min(seen, page) / page * len + 0.5)))
+        local at = math.floor(pan / page * len + 0.5)
+        return math.max(0, math.min(len - n, at)), n
+    end
+    local ix, iw = span(v.pan_x, v.area_w / v.zoom, v.canvas_w, w)
+    local iy, ih = span(v.pan_y, v.area_h / v.zoom, v.canvas_h, h)
+    local pad = Screen:scaleBySize(8)
+    local card = { x = x - pad, y = y - pad, w = w + 2 * pad, h = h + 2 * pad, r = Screen:scaleBySize(10) }
+    return { x = x, y = y, w = w, h = h }, { x = x + ix, y = y + iy, w = iw, h = ih }, line, card
+end
+
+-- One step of a pan: show the map where the view is now, and put off the page.
+function InkAwayView:panMapStep()
+    self._pan_map = true
+    local _, _, _, card = self:panMapRects()
+    local r = { x0 = card.x, y0 = card.y, x1 = card.x + card.w, y1 = card.y + card.h }
+    -- only the map changed, so the paint blits just that part of the area
+    self._blit_rect = InkGeom.growRect(self._blit_rect, r.x0, r.y0, r.x1, r.y1)
+    self:liveDirty("fast", r)
+    UIManager:unschedule(self._pan_settle_cb)
+    UIManager:scheduleIn(PAN_SETTLE_SEC, self._pan_settle_cb)
+end
+
+-- The pan has rested (or something needs the page where it is, see beginStroke):
+-- take the map away and draw the page there.
+function InkAwayView:settlePan()
+    UIManager:unschedule(self._pan_settle_cb)
+    if not self._pan_map then return end
+    self._pan_map = nil
+    if self.closing then return end
+    self:liveDrop()   -- a map refresh still waiting is covered by this one
+    self:redraw()
+end
+
+-- Paint the map over the drawing area (see paintTo): the card, the page on it,
+-- and the part in view as a rounded box, in the accent on a coloured accent.
+function InkAwayView:paintPanMap(bb, x, y)
+    local v = self.view
+    local m, i, line, card = self:panMapRects()
+    local ox, oy = x + v.area_x, y + v.area_y
+    local S1 = math.max(1, Screen:scaleBySize(1))
+    bb:paintRoundedRect(ox + card.x, oy + card.y, card.w, card.h, CARD_FILL, card.r)
+    bb:paintBorder(ox + card.x, oy + card.y, card.w, card.h, S1, CARD_BORDER, card.r)
+    -- the page: white with a darker edge, its corners a little rounded
+    local pr = Screen:scaleBySize(3)
+    bb:paintRoundedRect(ox + m.x, oy + m.y, m.w, m.h, WHITE, pr)
+    bb:paintBorder(ox + m.x, oy + m.y, m.w, m.h, S1, PAGE_EDGE, pr)
+    -- the part in view
+    local vr = math.max(2, math.floor(pr / 2))
+    if Accent.get().custom then
+        Accent.paintRounded(bb, ox + i.x, oy + i.y, i.w, i.h, vr)
+    else
+        bb:paintRoundedRect(ox + i.x, oy + i.y, i.w, i.h, VIEW_FILL, vr)
+        bb:paintBorder(ox + i.x, oy + i.y, i.w, i.h, line, BLACK, vr)
+    end
+    -- dark (see ink/ui/theme.lua): inverted within the card's shape, as the floating controls are
+    if Theme.invert() then Theme.invertRounded(bb, ox + card.x, oy + card.y, card.w, card.h, card.r) end
 end
 
 -- Recompute the drawing area (it shrinks by nb_bar_h in notebook mode) and the

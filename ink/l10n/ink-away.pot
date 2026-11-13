@@ -753,6 +753,14 @@ msgstr ""
 msgid "Book notes"
 msgstr ""
 
+#: ink/reader/inkview.lua
+msgid "Bookmark added"
+msgstr ""
+
+#: ink/reader/inkview.lua
+msgid "Bookmark removed"
+msgstr ""
+
 #: ink/guide.lua
 msgid "Books"
 msgstr ""
@@ -2959,6 +2967,10 @@ msgstr ""
 
 #: ink/sync/errors.lua
 msgid "Many files seem to be missing"
+msgstr ""
+
+#: ink/view/settings.lua
+msgid "Map while panning"
 msgstr ""
 
 #: ink/view/notebook.lua
@@ -5783,6 +5795,10 @@ msgstr ""
 
 #: ink/guide.lua
 msgid "Where to start"
+msgstr ""
+
+#: ink/view/settings.lua
+msgid "While you move around a zoomed-in page, a small map shows where you are and the page is drawn when you stop. Smoother on a slow screen."
 msgstr ""
 
 #: ink/framecover.lua

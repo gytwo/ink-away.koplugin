@@ -264,6 +264,7 @@ function InkAwayView:init()
         end
     end
     self._reconcile_cb = function() self:runReconcile() end
+    self._pan_settle_cb = function() self:settlePan() end
     self._straighten_cb = function() self:straightenNow() end
     -- Throttled refresh while dragging a lasso selection, so pan events never flood
     -- the panel.
@@ -459,6 +460,7 @@ function InkAwayView:onCloseWidget()
     UIManager:unschedule(self._autosave_tick)
     UIManager:unschedule(self._live_flush_cb)
     UIManager:unschedule(self._reconcile_cb)
+    UIManager:unschedule(self._pan_settle_cb)
     UIManager:unschedule(self._pen_hold_cb)
     UIManager:unschedule(self._straighten_cb)
     UIManager:unschedule(self._pdf_prefetch_cb)
@@ -828,7 +830,11 @@ end
 function InkAwayView:onIaHold(_, ges)
     if self:fingerRejected(ges and ges.pos) then return true end
     if self._clip_press then return true end
-    if self._fab_press then self._fab_press = nil; return true end
+    if self._fab_press then
+        local kind = self._fab_press; self._fab_press = nil
+        self:fabHold(kind)   -- (most controls do nothing on a hold)
+        return true
+    end
     -- a long press in the text box being edited offers to paste there
     if self.editing_text and self:textHoldAt(ges and ges.pos) then return true end
     -- swallow holds while drawing or placing, so they never become a long-press menu
@@ -1031,6 +1037,8 @@ function InkAwayView:paintTo(bb, x, y)
 
     -- the floating controls, on top (a region blit paints the ones it reaches)
     self:drawFabs(bb, x, y, br)
+    -- the map of a pan in progress, over everything (see panMapStep)
+    if self._pan_map then self:paintPanMap(bb, x, y) end
 end
 
 -- White around the drawing area (the area itself is blitted over it). A mode

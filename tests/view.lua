@@ -3420,6 +3420,30 @@ do
     ok(grid.title == "browsetest", "dialogs: the arrow goes back up")
     pickPath(D .. "/b.png")
     ok(file == D .. "/b.png", "dialogs: a tap on a picture picks it")
+    -- hidden folders (a .emotis of pictures): listed only when KOReader's own list shows hidden files
+    os.execute("mkdir -p '" .. D .. "/.emotis'")
+    local hf = io.open(D .. "/.emotis/cat.png", "w"); hf:write("x"); hf:close()
+    local function shown()
+        view:pickFile(D, function() end, view.isPictureName)
+        local g = UIManager.shown
+        local out = {}
+        for _, it in ipairs(g.items) do out[#out + 1] = it.label end
+        g:close()
+        return table.concat(out, ","), g
+    end
+    ok(not shown():find(".emotis", 1, true), "dialogs: a hidden folder is not listed while hidden files are off")
+    _G.G_reader_settings.data.show_hidden = true
+    local with, wg = shown()
+    ok(with:find(".emotis", 1, true) and with:find("Sub", 1, true), "dialogs: it is listed once KOReader shows hidden files (" .. with .. ")")
+    ok(with:find(".hidden", 1, true), "dialogs: with the other hidden folders")
+    view:pickFile(D, function() end, view.isPictureName)
+    local hg = UIManager.shown
+    for _, it in ipairs(hg.items) do if it.label == ".emotis" then hg.on_pick(it) end end
+    ok(hg.title == ".emotis" and #hg.items == 1 and hg.items[1].label == "cat.png" and hg.items[1].picture,
+        "dialogs: and its pictures can be picked")
+    hg:close()
+    _G.G_reader_settings.data.show_hidden = nil
+    os.execute("rm -rf '" .. D .. "/.emotis'")
     -- anything else, a PDF, is chosen from KOReader's own file list
     file = nil
     view:pickFile(D, function(p) file = p end, function(n) return n:lower():match("%.pdf$") ~= nil end, "pdfpen", nil, "From a PDF")
@@ -6042,6 +6066,129 @@ do
     UIManager:close(view)
     G_reader_settings.data.inkaway_library_dir = TestEnv.libraryDir()
     G_reader_settings.data.inkaway_last_doc = nil
+    UIManager.reset()
+end
+
+-- Panning a zoomed-in page on a colour panel: the page is not scaled or refreshed
+-- while it moves. A small map in the middle of the area (the page's outline, the
+-- visible part as a box in it) is refreshed with the fast waveform instead, and
+-- the page is drawn once, a moment after the last step. A grey panel redraws on
+-- every step, as it always did, unless the map is turned on in Settings; a
+-- colour panel does too when it is turned off there.
+do
+    Screen:setRotationMode(0); Screen:setSize(1072, 1448)
+    G_reader_settings.data.inkaway_last_doc = nil
+    UIManager.reset()
+    local InkAwayView = dofile("ink/view.lua")
+    local function drag(colour, set)
+        G_reader_settings.data.inkaway_pan_map = set
+        local view = InkAwayView:new{}
+        view.colorScreen = function() return colour end
+        UIManager:show(view)
+        local v = view.view
+        view:zoomStep(1); view:zoomStep(1)
+        view:setTool("pan")
+        local renders = 0
+        local real = view.renderView
+        view.renderView = function(...) renders = renders + 1; return real(...) end
+        local y0 = v.area_y + 600
+        local py0 = v.pan_y
+        UIManager.refreshes = {}
+        view:onIaTouch(nil, pos(500, y0))
+        for i = 1, 6 do view:onIaPan(nil, pos(500, y0 - 20 * i)) end
+        view:onIaPanRelease(nil, pos(500, y0 - 120))
+        view:liveFlush()
+        local moving = UIManager.refreshes
+        UIManager.refreshes = {}
+        return view, function() return renders end, moving, v.pan_y - py0
+    end
+
+    local view, renders, moving, moved = drag(true)
+    local v = view.view
+    ok(math.abs(moved - 120 / v.zoom) < 1e-6, "pan map: the view ends where the finger left it")
+    ok(renders() == 0 and view._pan_map == true, "pan map: the page is not scaled while it moves, or at the lift")
+    local m, box = view:panMapRects()
+    local fast, small = #moving >= 1, true
+    for _, r in ipairs(moving) do
+        if r.mode ~= "fast" then fast = false end
+        local g = r.region
+        if not (g and g.x <= v.area_x + m.x and g.y <= v.area_y + m.y
+            and g.x + g.w >= v.area_x + m.x + m.w and g.y + g.h >= v.area_y + m.y + m.h
+            and g.w < v.area_w / 2 and g.h < v.area_h / 2) then small = false end
+    end
+    ok(fast and small, ("pan map: only the map is refreshed, with the fast waveform (%d)"):format(#moving))
+    ok(math.abs((m.x + m.w / 2) - v.area_w / 2) <= 1 and math.abs((m.y + m.h / 2) - v.area_h / 2) <= 1,
+        "pan map: it sits in the middle of the drawing area")
+    ok(box.x >= m.x and box.y >= m.y and box.x + box.w <= m.x + m.w and box.y + box.h <= m.y + m.h
+        and math.abs(box.w / m.w - (v.area_w / v.zoom) / v.canvas_w) < 0.05
+        and math.abs((box.y - m.y) / m.h - v.pan_y / v.canvas_h) < 0.05,
+        "pan map: the box inside it is the part of the page in view")
+    -- the paint draws the map's outline over the page
+    view:paintTo(Screen.bb, 0, 0)
+    ok(UIManager.scheduled[view._pan_settle_cb], "pan map: the page waits for the pan to rest")
+    UIManager.fireScheduled()
+    local settle = UIManager.refreshes
+    local g = settle[1] and settle[1].region
+    ok(renders() == 1 and not view._pan_map and #settle == 1 and settle[1].mode == "ui"
+        and g and g.x == v.area_x and g.y == v.area_y and g.w == v.area_w and g.h == v.area_h,
+        "pan map: once it rests the page is drawn where it ended, in one refresh of the area")
+    -- at the edge nothing moves, so there is no map and nothing to refresh
+    for _ = 1, 40 do view:panByScreen(0, 400) end
+    view:liveFlush(); UIManager.fireScheduled()
+    UIManager.refreshes = {}
+    view:panByScreen(0, 400)
+    view:liveFlush(); UIManager.fireScheduled()
+    ok(v.pan_y == 0 and #UIManager.refreshes == 0 and not view._pan_map,
+        "pan map: nothing is shown or refreshed at the page's edge")
+    -- a stroke that starts before the pan has rested draws on the page where it is
+    view:panByScreen(0, -50)
+    local before = renders()
+    view:setTool("pen")
+    view:onIaTouch(nil, pos(500, v.area_y + 300))
+    view:onIaPan(nil, pos(520, v.area_y + 320))
+    ok(not view._pan_map and renders() == before + 1 and not UIManager.scheduled[view._pan_settle_cb],
+        "pan map: a stroke begun before it rests draws the page first")
+    view:onIaPanRelease(nil, pos(520, v.area_y + 320))
+    UIManager.fireScheduled()
+    -- a zoom draws the page itself, so the map goes with it
+    view:panByScreen(0, -50)
+    view:zoomStep(-1)
+    ok(not view._pan_map and not UIManager.scheduled[view._pan_settle_cb], "pan map: a zoom replaces it")
+    view:panByScreen(0, -50)
+    ok(UIManager.scheduled[view._pan_settle_cb], "pan map: a step waits to settle")
+    UIManager:close(view)
+    ok(not UIManager.scheduled[view._pan_settle_cb] and not UIManager.scheduled[view._live_flush_cb],
+        "pan map: closing leaves none of it scheduled")
+
+    view, renders, moving = drag(false)
+    local ui = true
+    for _, r in ipairs(moving) do if r.mode ~= "ui" then ui = false end end
+    ok(renders() == 6 and #moving == 6 and ui and not view._pan_map, "grey pan: every step redraws, as before")
+    UIManager.fireScheduled()
+    ok(#UIManager.refreshes == 0, "grey pan: nothing follows the lift")
+    UIManager:close(view)
+
+    -- the setting: the map on a grey panel, and none on a colour one
+    ok(view:panMapOn() == false, "pan map setting: off on a grey panel until it is asked for")
+    view, renders, moving = drag(false, true)
+    fast = #moving >= 1
+    for _, r in ipairs(moving) do if r.mode ~= "fast" then fast = false end end
+    ok(view:panMapOn() and renders() == 0 and view._pan_map == true and fast,
+        "pan map setting: turned on, a grey panel pans with the map")
+    UIManager.fireScheduled()
+    ok(renders() == 1 and not view._pan_map and #UIManager.refreshes == 1 and UIManager.refreshes[1].mode == "ui",
+        "pan map setting: and draws the page once it rests")
+    UIManager:close(view)
+    view, renders, moving = drag(true, false)
+    ok(not view:panMapOn() and renders() == 6 and #moving == 6 and not view._pan_map,
+        "pan map setting: turned off, a colour panel redraws on every step")
+    UIManager:close(view)
+    view = drag(true)
+    ok(view:panMapOn() == true, "pan map setting: on for a colour panel by default")
+    view.onAndroid = function() return true end
+    ok(view:panMapOn() == false, "pan map setting: never on Android, which paces its own pans")
+    UIManager:close(view)
+    G_reader_settings.data.inkaway_pan_map = nil
     UIManager.reset()
 end
 
